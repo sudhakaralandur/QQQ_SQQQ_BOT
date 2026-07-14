@@ -329,7 +329,7 @@ class SignalDetector:
             return True, "QQQ", f"QQQ bullish (RSI {qqq_rsi:.0f}, SPY bullish)"
         
         # BEARISH ENTRY: QQQ weak + SPY trending down
-        if not spy_ema_bullish and not sqqq_above_slow and sqqq_rsi < 40:
+        if not spy_ema_bullish and sqqq_above_slow and sqqq_rsi > 60:
             return True, "SQQQ", f"SQQQ bullish (RSI {sqqq_rsi:.0f}, SPY bearish)"
         
         return False, None, "No signal"
