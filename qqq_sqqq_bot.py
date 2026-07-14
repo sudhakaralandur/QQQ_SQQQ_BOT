@@ -708,6 +708,17 @@ class QQQSQQQBot:
             self._close_position_eod()
             stream.close()
             log.info("Bot stopped. Check logs/ folder for analysis CSV files.")
+            # ── EOD auto-analysis ─────────────────────────────────────────
+            # Runs the Phase-1 analyzer against today's logs and writes an
+            # HTML report to logs/report_latest.html. Wrapped in try/except so
+            # a reporting error can never take down the trading process.
+            try:
+                import analyzer
+                report_path = analyzer.run_analysis(verbose=True)
+                log.info(f"📊 EOD report written: {report_path}")
+                log.info("   Open logs/report_latest.html in a browser to review.")
+            except Exception as e:
+                log.error(f"EOD analysis failed (bot itself is fine): {e}", exc_info=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
