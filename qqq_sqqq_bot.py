@@ -670,8 +670,11 @@ class QQQSQQQBot:
         if order:
             exit_details = self.state.exit(current_price, exit_reason)
             if exit_details:
-                TradeLogger.log_trade(exit_details)
-                log.info(f"Daily P&L: ${self.state.daily_pnl:+.2f}")
+                try:
+                    TradeLogger.log_trade(exit_details)
+                    log.info(f"Daily P&L: ${self.state.daily_pnl:+.2f}")
+                except Exception as log_err:
+                    log.error(f"TRADE LOG FAILED: {log_err} | details={exit_details}", exc_info=True)
     
     def _close_position_eod(self):
         """Close position at end of day."""
