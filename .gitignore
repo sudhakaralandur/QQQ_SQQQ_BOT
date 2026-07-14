@@ -1,0 +1,30 @@
+# Sensitive files — NEVER commit these
+config.py
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and output
+logs/
+*.csv
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
