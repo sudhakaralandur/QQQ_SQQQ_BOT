@@ -183,7 +183,7 @@ class IndicatorEngine:
             result["above_ema_slow"] = price > result["ema_slow"]
             result["ema_bullish"] = result["ema_fast"] > result["ema_slow"]
         
-        result["price"] = price
+        result["price"] = float(price)
         
         return result
 
@@ -209,6 +209,7 @@ class TradeState:
         self.hibernating = False
     
     def enter(self, ticker, qty, entry_price):
+        entry_price = float(entry_price)
         """Record a new trade entry."""
         self.open_position = {
             "ticker": ticker,
