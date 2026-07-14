@@ -614,7 +614,9 @@ class QQQSQQQBot:
             if self.state.open_position:
                 pos = self.state.open_position
                 hold_min = (now - pos["entry_time"]).total_seconds() / 60
-                current_price = indicators.get("price", 0)
+                # CRITICAL: use the position ticker's price, not the arriving bar's price
+                pos_ticker = pos["ticker"]
+                current_price = self.indicators.compute(pos_ticker).get("price", 0)
                 
                 should_exit, exit_reason = SignalDetector.should_exit(
                     current_price, self.state, hold_min
