@@ -570,7 +570,7 @@ class QQQSQQQBot:
         TradeLogger.init_csv_files()
         log.info("QQQ_SQQQ_BOT initialized")
     
-    def on_bar(self, bar_data):
+    async def on_bar(self, bar_data):
         """
         Callback from Alpaca websocket when a new 5-min bar arrives.
         
