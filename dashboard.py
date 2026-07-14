@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 from flask import Flask, render_template_string
 
 app = Flask(__name__)
+app.jinja_env.globals.update(float=float, int=int)
 EST = ZoneInfo("America/New_York")
 
 # Paths to CSV files
