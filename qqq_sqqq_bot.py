@@ -44,6 +44,8 @@ from zoneinfo import ZoneInfo
 from collections import deque
 import threading
 import queue
+import signal
+import ctypes
 
 # ─────────────────────────────────────────────────────────────────────────────
 # IMPORTS & SETUP
@@ -567,6 +569,7 @@ class QQQSQQQBot:
         self.state = TradeState()
         self.data_queue = queue.Queue()
         self.running = False
+        self._shutdown_sent = False  # guards against sending SIGINT more than once
         
         TradeLogger.init_csv_files()
         log.info("QQQ_SQQQ_BOT initialized")
@@ -598,6 +601,18 @@ class QQQSQQQBot:
             
             # Check market hours (before 3:50 PM ET)
             now = datetime.now(EST)
+
+            # Market close (4:00 PM ET): trigger a clean, safe shutdown of the
+            # whole process. Reuses the exact same shutdown path as Ctrl+C
+            # (KeyboardInterrupt -> finally: close position, stop stream,
+            # write EOD report) by sending SIGINT to ourselves, instead of
+            # hand-rolling a second, less-tested shutdown path.
+            if now.time() >= time(16, 0) and not self._shutdown_sent:
+                self._shutdown_sent = True
+                log.info("Market closed (4:00 PM ET). Shutting down bot...")
+                os.kill(os.getpid(), signal.SIGINT)
+                return
+
             if now.time() >= time(15, 50):
                 if self.state.open_position:
                     log.info("📍 Market close approaching, EOD closing all positions")
@@ -728,9 +743,58 @@ class QQQSQQQBot:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# POST-SHUTDOWN: OPTIONAL PC SHUTDOWN (Windows only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+IDLE_THRESHOLD_SECONDS = 300  # 5 minutes idle = "not actively using the PC"
+
+
+def get_idle_seconds():
+    """Return how many seconds since the last keyboard/mouse input (Windows)."""
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+    lii = LASTINPUTINFO()
+    lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+    ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
+    millis_since_boot = ctypes.windll.kernel32.GetTickCount()
+    idle_ms = millis_since_boot - lii.dwTime
+    return idle_ms / 1000.0
+
+
+def maybe_shutdown_pc():
+    """
+    Called only after the bot has fully and safely shut down (position
+    closed, logs flushed, EOD report written). Shuts down the PC ONLY if
+    the user hasn't touched the mouse/keyboard recently. If the user is
+    actively at the machine, skip shutdown entirely and just log it.
+    """
+    try:
+        idle = get_idle_seconds()
+    except Exception as e:
+        log.error(f"Could not determine idle time, skipping PC shutdown: {e}")
+        return
+
+    if idle < IDLE_THRESHOLD_SECONDS:
+        log.info(
+            f"PC active (idle {idle:.0f}s < {IDLE_THRESHOLD_SECONDS}s threshold). "
+            f"Skipping shutdown — you're at the machine."
+        )
+        return
+
+    log.info(
+        f"PC idle {idle:.0f}s >= {IDLE_THRESHOLD_SECONDS}s threshold. "
+        f"Shutting down PC in 60s (run 'shutdown /a' to cancel)."
+    )
+    os.system("shutdown /s /t 60")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     bot = QQQSQQQBot()
-    bot.run()
+    bot.run()          # blocks until bot fully, safely shuts down (EOD)
+    maybe_shutdown_pc()  # only reached after clean shutdown above
+
