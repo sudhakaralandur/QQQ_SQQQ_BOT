@@ -68,9 +68,21 @@ import pandas as pd
 import numpy as np
 
 # Logging setup
+# Writes to BOTH console (when you're watching) and a daily log file
+# (so headless/unattended runs via Task Scheduler leave a record).
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_log_filename = os.path.join(
+    _LOG_DIR, f"bot_{datetime.now().strftime('%Y-%m-%d')}.log"
+)
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),                 # console (visible when interactive)
+        logging.FileHandler(_log_filename, encoding="utf-8"),  # file (visible when headless)
+    ],
 )
 log = logging.getLogger("QQQ_SQQQ_BOT")
 
