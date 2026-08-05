@@ -113,6 +113,12 @@ os.makedirs(LOG_DIR, exist_ok=True)
 TRADES_CSV = os.path.join(LOG_DIR, "trades.csv")
 SIGNALS_CSV = os.path.join(LOG_DIR, "signals.csv")
 BARS_CSV = os.path.join(LOG_DIR, "bars.csv")
+NEAR_MISSES_CSV = os.path.join(LOG_DIR, "near_misses.csv")
+
+# Near-miss tuning: how close (in RSI points) a setup must get to the RSI>60
+# threshold to be worth logging as a "near miss". 8 => log setups with RSI 52-60
+# where SPY regime + EMA alignment were otherwise correct.
+NEAR_MISS_RSI_WINDOW = 8.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -347,7 +353,45 @@ class SignalDetector:
             return True, "SQQQ", f"SQQQ bullish (RSI {sqqq_rsi:.0f}, SPY bearish)"
         
         return False, None, "No signal"
-    
+
+    @staticmethod
+    def detect_near_miss(indicators_qqq, indicators_sqqq, indicators_spy):
+        """
+        Detect a setup that ALMOST triggered but didn't, so we can measure
+        how much the strict gate is passing on. Measurement only.
+
+        Returns (side, reason) if it's a near miss, else (None, None).
+
+        A "near miss" = SPY regime is correct AND price/EMA alignment is
+        correct, but RSI fell just short of the 60 threshold (within
+        NEAR_MISS_RSI_WINDOW points, i.e. RSI roughly 52-60). Also flags the
+        inverse case: RSI cleared 60 but EMA alignment or SPY regime blocked it.
+        """
+        if not indicators_qqq or not indicators_sqqq or not indicators_spy:
+            return None, None
+
+        spy_ema_bullish = indicators_spy.get("ema_bullish", False)
+        qqq_rsi = indicators_qqq.get("rsi", 50)
+        qqq_above_slow = indicators_qqq.get("above_ema_slow", False)
+        sqqq_rsi = indicators_sqqq.get("rsi", 50)
+        sqqq_above_slow = indicators_sqqq.get("above_ema_slow", False)
+
+        low = 60.0 - NEAR_MISS_RSI_WINDOW
+
+        # --- BULLISH side (would have been a QQQ buy) ---
+        if spy_ema_bullish and qqq_above_slow and low <= qqq_rsi <= 60.0:
+            return "QQQ", f"RSI {qqq_rsi:.0f} just short of 60 (regime+EMA OK)"
+        if spy_ema_bullish and qqq_rsi > 60.0 and not qqq_above_slow:
+            return "QQQ", f"RSI {qqq_rsi:.0f} OK but price below EMA-slow"
+
+        # --- BEARISH side (would have been an SQQQ buy) ---
+        if (not spy_ema_bullish) and sqqq_above_slow and low <= sqqq_rsi <= 60.0:
+            return "SQQQ", f"RSI {sqqq_rsi:.0f} just short of 60 (regime+EMA OK)"
+        if (not spy_ema_bullish) and sqqq_rsi > 60.0 and not sqqq_above_slow:
+            return "SQQQ", f"RSI {sqqq_rsi:.0f} OK but price below EMA-slow"
+
+        return None, None
+
     @staticmethod
     def should_exit(current_price, trade_state, hold_minutes):
         """
@@ -430,6 +474,17 @@ class TradeLogger:
                     "timestamp", "ticker", "open", "high", "low", "close",
                     "volume", "ema_fast", "ema_slow", "rsi", "atr"
                 ])
+        
+        # Near-misses CSV (measurement only - setups that ALMOST fired)
+        if not os.path.exists(NEAR_MISSES_CSV):
+            with open(NEAR_MISSES_CSV, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp", "side", "miss_reason",
+                    "qqq_price", "qqq_rsi", "qqq_above_slow", "qqq_ema_bullish",
+                    "sqqq_price", "sqqq_rsi", "sqqq_above_slow", "sqqq_ema_bullish",
+                    "spy_price", "spy_rsi", "spy_ema_bullish"
+                ])
     
     @staticmethod
     def log_trade(exit_details):
@@ -470,6 +525,35 @@ class TradeLogger:
                 indicators_spy.get("ema_bullish", False),
             ])
     
+    @staticmethod
+    def log_near_miss(side, miss_reason, ind_qqq, ind_sqqq, ind_spy):
+        """
+        Log a setup that ALMOST fired but didn't. Measurement only - this
+        never affects trading. Writes to its own file so it can never
+        interfere with signals.csv or the analyzer.
+        """
+        try:
+            with open(NEAR_MISSES_CSV, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now(EST).isoformat(),
+                    side,
+                    miss_reason,
+                    f"{ind_qqq.get('price', 0):.2f}",
+                    f"{ind_qqq.get('rsi', 0):.1f}",
+                    ind_qqq.get("above_ema_slow", False),
+                    ind_qqq.get("ema_bullish", False),
+                    f"{ind_sqqq.get('price', 0):.2f}",
+                    f"{ind_sqqq.get('rsi', 0):.1f}",
+                    ind_sqqq.get("above_ema_slow", False),
+                    ind_sqqq.get("ema_bullish", False),
+                    f"{ind_spy.get('price', 0):.2f}",
+                    f"{ind_spy.get('rsi', 0):.1f}",
+                    ind_spy.get("ema_bullish", False),
+                ])
+        except Exception as e:
+            log.error(f"Near-miss log failed (non-critical): {e}")
+
     @staticmethod
     def log_bar(ticker, bar_dict, indicators):
         """Log a bar with computed indicators."""
@@ -661,6 +745,15 @@ class QQQSQQQBot:
                 if should_enter:
                     TradeLogger.log_signal("entry_signal", ticker, reason, ind_qqq, ind_sqqq, ind_spy)
                     self._execute_entry(ticker, ind_qqq if ticker == "QQQ" else ind_sqqq)
+                else:
+                    # Measurement only: record setups that ALMOST fired.
+                    miss_side, miss_reason = SignalDetector.detect_near_miss(
+                        ind_qqq, ind_sqqq, ind_spy
+                    )
+                    if miss_side:
+                        TradeLogger.log_near_miss(
+                            miss_side, miss_reason, ind_qqq, ind_sqqq, ind_spy
+                        )
         
         except Exception as e:
             log.error(f"Error in on_bar: {e}", exc_info=True)
@@ -809,4 +902,5 @@ if __name__ == "__main__":
     bot = QQQSQQQBot()
     bot.run()          # blocks until bot fully, safely shuts down (EOD)
     maybe_shutdown_pc()  # only reached after clean shutdown above
+
 
