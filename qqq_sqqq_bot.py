@@ -64,6 +64,9 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.live import StockDataStream
 from alpaca.data.enums import DataFeed
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 import pandas as pd
 import numpy as np
 
@@ -96,7 +99,16 @@ EST = ZoneInfo("America/New_York")
 CAPITAL_PER_TRADE = 2000.0          # Deploy this much on each trade
 DAILY_LOSS_LIMIT = 100.0             # Stop trading if daily loss exceeds this
 PROFIT_TARGET_PCT = 0.02             # Exit at +2% profit
-HARD_STOP_PCT = 0.01                 # Exit at -1% loss
+HARD_STOP_PCT = 0.01                 # Exit at -1% loss (legacy/Option "current")
+
+# ── STOP EXPERIMENT (shadow comparison of 3 stop rules) ──
+# Which stop the bot ACTUALLY trades on. "ATR" = Option B (live during test).
+#   "CURRENT" -> flat -1%   |   "OPTION_A" -> flat -2.5% for SQQQ, -1% for QQQ   |   "ATR" -> entry - ATR_STOP_MULT*ATR
+STOP_MODE = "OPTION_A"
+ATR_STOP_MULT = 1.5                  # Option B (5-min ATR): stop = entry_price - 1.5 * ATR5min(entry)
+ATR_DAILY_MULT = 1.5                 # Option B-daily: stop = entry_price - 1.5 * ATR_daily(entry)
+OPTION_A_STOP_PCT_SQQQ = 0.025       # Option A: -2.5% stop for SQQQ
+OPTION_A_STOP_PCT_QQQ = 0.01         # Option A: -1% stop for QQQ (unchanged)
 MIN_HOLD_MINUTES = 5                 # Minimum hold before exit allowed
 COOLDOWN_MINUTES = 5                 # Wait X min after exit before next entry
 ATR_PERIOD = 14                      # ATR lookback for volatility
@@ -114,6 +126,7 @@ TRADES_CSV = os.path.join(LOG_DIR, "trades.csv")
 SIGNALS_CSV = os.path.join(LOG_DIR, "signals.csv")
 BARS_CSV = os.path.join(LOG_DIR, "bars.csv")
 NEAR_MISSES_CSV = os.path.join(LOG_DIR, "near_misses.csv")
+STOP_COMPARISON_CSV = os.path.join(LOG_DIR, "stop_comparison.csv")
 
 # Near-miss tuning: how close (in RSI points) a setup must get to the RSI>60
 # threshold to be worth logging as a "near miss". 8 => log setups with RSI 52-60
@@ -237,6 +250,10 @@ class TradeState:
             "entry_price": entry_price,
             "entry_time": datetime.now(EST),
             "peak_price": entry_price,
+            "entry_atr": getattr(self, "_pending_entry_atr", 0.0),  # 5-min ATR at entry
+            "entry_atr_daily": getattr(self, "_pending_entry_atr_daily", 0.0),  # daily ATR at entry
+            "worst_price": entry_price,   # lowest price seen while holding (for MAE)
+            "worst_pct": 0.0,             # most-negative pnl_pct seen (Max Adverse Excursion)
         }
         log.info(f"🟢 ENTRY: {qty} shares of {ticker} @ ${entry_price:.2f}")
     
@@ -293,6 +310,94 @@ class TradeState:
 # ─────────────────────────────────────────────────────────────────────────────
 # SIGNAL DETECTOR — Entry/Exit Decision Logic
 # ─────────────────────────────────────────────────────────────────────────────
+
+_HIST_CLIENT = None
+
+def _get_hist_client():
+    """Lazy singleton historical data client (paper keys work for data)."""
+    global _HIST_CLIENT
+    if _HIST_CLIENT is None:
+        _HIST_CLIENT = StockHistoricalDataClient(config.KEY, config.SECRET)
+    return _HIST_CLIENT
+
+
+def fetch_daily_atr(ticker, period=14):
+    """
+    Fetch ~ (period+1) daily bars and compute a simple daily ATR.
+    Returns float ATR in price units, or 0.0 on any failure (non-critical).
+    Called once per entry for the stop experiment.
+    """
+    try:
+        client = _get_hist_client()
+        end = datetime.now(EST)
+        start = end - timedelta(days=period * 3 + 10)  # calendar buffer for weekends/holidays
+        req = StockBarsRequest(
+            symbol_or_symbols=ticker,
+            timeframe=TimeFrame.Day,
+            start=start,
+            end=end,
+            feed=DataFeed.IEX,
+        )
+        bars = client.get_stock_bars(req)
+        df = bars.df
+        if df is None or len(df) < 2:
+            return 0.0
+        # df may be multi-indexed by symbol; reduce to this ticker
+        if "symbol" in df.index.names:
+            df = df.xs(ticker, level="symbol")
+        highs = df["high"].values
+        lows = df["low"].values
+        closes = df["close"].values
+        trs = []
+        for i in range(1, len(closes)):
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+            trs.append(tr)
+        if not trs:
+            return 0.0
+        use = trs[-period:] if len(trs) >= period else trs
+        return float(sum(use) / len(use))
+    except Exception as e:
+        log.error(f"Daily ATR fetch failed for {ticker} (non-critical): {e}")
+        return 0.0
+
+
+def _live_stop_pct(pos):
+    """
+    Return the LIVE stop distance as a positive percent (e.g. 1.0 = -1%),
+    based on STOP_MODE. Used by should_exit to actually trade one rule.
+    """
+    ticker = pos["ticker"]
+    entry = pos["entry_price"]
+    atr = pos.get("entry_atr", 0.0) or 0.0
+
+    if STOP_MODE == "ATR" and atr > 0 and entry > 0:
+        return (ATR_STOP_MULT * atr) / entry * 100.0
+    if STOP_MODE == "OPTION_A":
+        return (OPTION_A_STOP_PCT_SQQQ if ticker == "SQQQ" else OPTION_A_STOP_PCT_QQQ) * 100.0
+    # default / CURRENT
+    return HARD_STOP_PCT * 100.0
+
+
+def _stop_pct_for_rule(rule, ticker, entry_price, entry_atr, entry_atr_daily=0.0):
+    """Stop distance (positive %) for a named rule, for shadow comparison."""
+    if rule == "CURRENT":
+        return HARD_STOP_PCT * 100.0
+    if rule == "OPTION_A":
+        return (OPTION_A_STOP_PCT_SQQQ if ticker == "SQQQ" else OPTION_A_STOP_PCT_QQQ) * 100.0
+    if rule == "ATR_5MIN":
+        if entry_atr > 0 and entry_price > 0:
+            return (ATR_STOP_MULT * entry_atr) / entry_price * 100.0
+        return HARD_STOP_PCT * 100.0  # fallback if ATR missing
+    if rule == "ATR_DAILY":
+        if entry_atr_daily > 0 and entry_price > 0:
+            return (ATR_DAILY_MULT * entry_atr_daily) / entry_price * 100.0
+        return HARD_STOP_PCT * 100.0  # fallback if daily ATR missing
+    return HARD_STOP_PCT * 100.0
+
 
 class SignalDetector:
     """
@@ -410,9 +515,15 @@ class SignalDetector:
         pos = trade_state.open_position
         entry_price = pos["entry_price"]
         pnl_pct = (current_price - entry_price) / entry_price * 100
-        
-        # Hard stop — can trigger anytime
-        if pnl_pct <= -HARD_STOP_PCT * 100:
+
+        # Track Max Adverse Excursion (worst dip) for the stop experiment
+        if pnl_pct < pos.get("worst_pct", 0.0):
+            pos["worst_pct"] = pnl_pct
+            pos["worst_price"] = current_price
+
+        # Hard stop — rule depends on STOP_MODE (live stop for the experiment)
+        stop_pct = _live_stop_pct(pos)   # positive number, e.g. 1.0 means -1%
+        if pnl_pct <= -stop_pct:
             return True, f"Hard stop ({pnl_pct:.2f}%)"
         
         # Profit target — only after min hold
@@ -485,6 +596,23 @@ class TradeLogger:
                     "sqqq_price", "sqqq_rsi", "sqqq_above_slow", "sqqq_ema_bullish",
                     "spy_price", "spy_rsi", "spy_ema_bullish"
                 ])
+
+        # Stop-comparison CSV (shadow experiment: 3 stop rules scored per trade)
+        if not os.path.exists(STOP_COMPARISON_CSV):
+            with open(STOP_COMPARISON_CSV, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "entry_time", "exit_time", "ticker", "qty",
+                    "entry_price", "actual_exit_price", "actual_exit_reason",
+                    "actual_pnl", "actual_pnl_pct", "hold_minutes",
+                    "live_stop_mode", "entry_atr_5min", "entry_atr_daily",
+                    "worst_pnl_pct", "worst_price",
+                    # For each rule: its stop %, and whether the trade's worst dip would have triggered it
+                    "CURRENT_stop_pct", "CURRENT_would_fire",
+                    "OPTION_A_stop_pct", "OPTION_A_would_fire",
+                    "ATR_5MIN_stop_pct", "ATR_5MIN_would_fire",
+                    "ATR_DAILY_stop_pct", "ATR_DAILY_would_fire",
+                ])
     
     @staticmethod
     def log_trade(exit_details):
@@ -553,6 +681,56 @@ class TradeLogger:
                 ])
         except Exception as e:
             log.error(f"Near-miss log failed (non-critical): {e}")
+
+    @staticmethod
+    def log_stop_comparison(pos, exit_details):
+        """
+        Shadow experiment (measurement only): for the trade that just closed,
+        record what EACH of the 3 stop rules would have done, using the trade's
+        Max Adverse Excursion (worst_pnl_pct) captured while holding.
+
+        A rule "would fire" if the worst dip reached its stop distance. Because
+        the LIVE stop is whatever STOP_MODE is, the live rule's actual exit is
+        also recorded, so analysis can compare fired/not-fired cleanly.
+        """
+        ticker = pos["ticker"]
+        entry_price = pos["entry_price"]
+        entry_atr = pos.get("entry_atr", 0.0) or 0.0
+        entry_atr_daily = pos.get("entry_atr_daily", 0.0) or 0.0
+        worst_pct = pos.get("worst_pct", 0.0)      # most-negative pnl_pct seen (<=0)
+        worst_price = pos.get("worst_price", entry_price)
+
+        rules = {}
+        for rule in ("CURRENT", "OPTION_A", "ATR_5MIN", "ATR_DAILY"):
+            stop_pct = _stop_pct_for_rule(rule, ticker, entry_price, entry_atr, entry_atr_daily)
+            would_fire = worst_pct <= -stop_pct   # did worst dip reach this stop?
+            rules[rule] = (stop_pct, would_fire)
+
+        try:
+            with open(STOP_COMPARISON_CSV, "a", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    pos["entry_time"].isoformat() if hasattr(pos["entry_time"], "isoformat") else pos["entry_time"],
+                    exit_details["exit_time"].isoformat() if hasattr(exit_details["exit_time"], "isoformat") else exit_details["exit_time"],
+                    ticker, pos["qty"],
+                    f"{entry_price:.4f}",
+                    f"{exit_details['exit_price']:.4f}",
+                    exit_details["reason"],
+                    f"{exit_details['pnl']:.2f}",
+                    f"{exit_details['pnl_pct']:.4f}",
+                    f"{exit_details['hold_minutes']:.1f}",
+                    STOP_MODE,
+                    f"{entry_atr:.4f}",
+                    f"{entry_atr_daily:.4f}",
+                    f"{worst_pct:.4f}",
+                    f"{worst_price:.4f}",
+                    f"{rules['CURRENT'][0]:.4f}", rules['CURRENT'][1],
+                    f"{rules['OPTION_A'][0]:.4f}", rules['OPTION_A'][1],
+                    f"{rules['ATR_5MIN'][0]:.4f}", rules['ATR_5MIN'][1],
+                    f"{rules['ATR_DAILY'][0]:.4f}", rules['ATR_DAILY'][1],
+                ])
+        except Exception as e:
+            log.error(f"Stop-comparison write failed (non-critical): {e}")
 
     @staticmethod
     def log_bar(ticker, bar_dict, indicators):
@@ -774,6 +952,9 @@ class QQQSQQQBot:
         # Submit order
         order = self.broker.submit_order(ticker, qty, "buy")
         if order:
+            # Stash entry ATRs so TradeState.enter() can record them (stop experiment)
+            self.state._pending_entry_atr = float(indicators.get("atr", 0.0) or 0.0)
+            self.state._pending_entry_atr_daily = fetch_daily_atr(ticker)  # 1 REST call, wrapped
             self.state.enter(ticker, qty, current_price)
             TradeLogger.log_signal("entry_executed", ticker, f"Bought {qty} @ ${current_price:.2f}", 
                                    self.indicators.compute("QQQ"), 
@@ -788,6 +969,8 @@ class QQQSQQQBot:
             "sell"
         )
         if order:
+            # Snapshot position BEFORE exit() clears it (needed for stop experiment)
+            pos_snapshot = dict(self.state.open_position)
             exit_details = self.state.exit(current_price, exit_reason)
             if exit_details:
                 try:
@@ -795,6 +978,11 @@ class QQQSQQQBot:
                     log.info(f"Daily P&L: ${self.state.daily_pnl:+.2f}")
                 except Exception as log_err:
                     log.error(f"TRADE LOG FAILED: {log_err} | details={exit_details}", exc_info=True)
+                # Shadow experiment: score all 3 stop rules on this trade (measurement only)
+                try:
+                    TradeLogger.log_stop_comparison(pos_snapshot, exit_details)
+                except Exception as cmp_err:
+                    log.error(f"Stop-comparison log failed (non-critical): {cmp_err}", exc_info=True)
     
     def _close_position_eod(self):
         """Close position at end of day."""
