@@ -37,6 +37,7 @@ USAGE:
 import sys
 import os
 import logging
+from logging.handlers import RotatingFileHandler
 import json
 import csv
 from datetime import datetime, time, timedelta
@@ -84,9 +85,24 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     handlers=[
         logging.StreamHandler(),                 # console (visible when interactive)
-        logging.FileHandler(_log_filename, encoding="utf-8"),  # file (visible when headless)
+        # Size-capped file so an internet-disruption error loop can't bloat it:
+        # 5 MB per file, keep 3 rotated backups (bot_YYYY-MM-DD.log.1/.2/.3).
+        RotatingFileHandler(
+            _log_filename, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        ),
     ],
 )
+
+# Silence noisy third-party websocket loggers. On any internet blip the
+# `websockets` library dumps a full multi-line traceback (WinError 121 /
+# "data transfer failed"). It's harmless — alpaca-py auto-reconnects — but it
+# floods the log file. Raise these to CRITICAL so the tracebacks stop; we keep
+# alpaca's own concise one-line "restarting connection"/"connected" messages,
+# which are on the separate `alpaca.data.live.websocket` logger and stay at INFO.
+for _noisy in ("websockets", "websockets.client", "websockets.legacy",
+               "websockets.legacy.protocol"):
+    logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+
 log = logging.getLogger("QQQ_SQQQ_BOT")
 
 EST = ZoneInfo("America/New_York")
