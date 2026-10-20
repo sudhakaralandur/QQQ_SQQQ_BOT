@@ -80,6 +80,56 @@ _log_filename = os.path.join(
     _LOG_DIR, f"bot_{datetime.now().strftime('%Y-%m-%d')}.log"
 )
 
+
+class DedupFilter(logging.Filter):
+    """
+    Collapse reconnect-storm spam into a readable summary.
+
+    During an internet outage, alpaca-py retries the websocket ~1000x/sec, and
+    each failure logs an error line + a full multi-line traceback. One outage
+    can add tens of thousands of lines to the log file.
+
+    This filter lets the FIRST occurrence of a repeated message through, then
+    suppresses identical repeats. When the message finally changes (e.g. the
+    connection recovers), it emits a single "... suppressed N identical
+    messages" line so the outage is still visible — just compressed.
+
+    It also strips tracebacks off the suppressed records (a connection error
+    during an outage doesn't need its stack dumped thousands of times).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._last_key = None
+        self._suppressed = 0
+
+    def filter(self, record):
+        # Key on logger + level + the message template (not the formatted args),
+        # so a steady stream of the same error collapses even if timestamps differ.
+        key = (record.name, record.levelno, record.getMessage())
+
+        if key == self._last_key:
+            # Repeat of the message we're already sitting on -> suppress it,
+            # but keep a running count so we can report it later.
+            self._suppressed += 1
+            return False
+
+        # A new, different message is coming through.
+        if self._suppressed > 0:
+            # Annotate this record so the formatted output notes how many we hid.
+            # We piggyback on the record by prepending a summary via a flag the
+            # formatter picks up below.
+            record.msg = (
+                f"[{self._suppressed} identical prior message(s) suppressed] "
+                f"{record.getMessage()}"
+            )
+            record.args = ()
+            self._suppressed = 0
+
+        self._last_key = key
+        return True
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -93,15 +143,38 @@ logging.basicConfig(
     ],
 )
 
+# Attach the de-dup filter to the ROOT handlers so it applies to every logger,
+# including alpaca's. This is what tames the reconnect storm: the first error of
+# an outage is logged, repeats are collapsed, and recovery prints a summary.
+for _h in logging.getLogger().handlers:
+    _h.addFilter(DedupFilter())
+
 # Silence noisy third-party websocket loggers. On any internet blip the
 # `websockets` library dumps a full multi-line traceback (WinError 121 /
-# "data transfer failed"). It's harmless — alpaca-py auto-reconnects — but it
-# floods the log file. Raise these to CRITICAL so the tracebacks stop; we keep
-# alpaca's own concise one-line "restarting connection"/"connected" messages,
-# which are on the separate `alpaca.data.live.websocket` logger and stay at INFO.
+# "data transfer failed"). It's harmless — alpaca-py auto-reconnects. Raise
+# these to CRITICAL so their tracebacks never reach the file at all.
 for _noisy in ("websockets", "websockets.client", "websockets.legacy",
                "websockets.legacy.protocol"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+
+# Alpaca's own websocket logger (alpaca.data.live.websocket) is the one that
+# floods during a LONG outage (getaddrinfo/DNS retries ~1000x/sec, each with a
+# traceback). Keep it at WARNING so routine INFO connect/subscribe chatter stays
+# quiet, let real errors through ONCE (the DedupFilter collapses the repeats),
+# and strip the exception tracebacks it attaches so the file stays readable.
+logging.getLogger("alpaca.data.live.websocket").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+
+
+class _NoTracebackFilter(logging.Filter):
+    """Drop exception tracebacks from alpaca's websocket error records."""
+    def filter(self, record):
+        record.exc_info = None
+        record.exc_text = None
+        return True
+
+
+logging.getLogger("alpaca.data.live.websocket").addFilter(_NoTracebackFilter())
 
 log = logging.getLogger("QQQ_SQQQ_BOT")
 
