@@ -193,7 +193,9 @@ HARD_STOP_PCT = 0.01                 # Exit at -1% loss (legacy/Option "current"
 # ── STOP EXPERIMENT (shadow comparison of 3 stop rules) ──
 # Which stop the bot ACTUALLY trades on. "ATR" = Option B (live during test).
 #   "CURRENT" -> flat -1%   |   "OPTION_A" -> flat -2.5% for SQQQ, -1% for QQQ   |   "ATR" -> entry - ATR_STOP_MULT*ATR
-STOP_MODE = "OPTION_A"
+STOP_MODE = "CURRENT"   # reverted from OPTION_A on 2026-10-20: Option A underperformed
+                        # (-$38 vs -$17 for CURRENT over the 43-trade live test). Shadow
+                        # logging of all 4 rules stays ON so ATR_DAILY keeps gathering evidence.
 ATR_STOP_MULT = 1.5                  # Option B (5-min ATR): stop = entry_price - 1.5 * ATR5min(entry)
 ATR_DAILY_MULT = 1.5                 # Option B-daily: stop = entry_price - 1.5 * ATR_daily(entry)
 OPTION_A_STOP_PCT_SQQQ = 0.025       # Option A: -2.5% stop for SQQQ
