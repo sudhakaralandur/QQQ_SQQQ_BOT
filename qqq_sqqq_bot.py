@@ -71,99 +71,64 @@ from alpaca.data.timeframe import TimeFrame
 import pandas as pd
 import numpy as np
 
-# Logging setup
-# Writes to BOTH console (when you're watching) and a daily log file
-# (so headless/unattended runs via Task Scheduler leave a record).
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging setup — THREE separate streams:
+#   1. logs/bot_YYYY-MM-DD.log     -> TRADES + P&L ONLY (clean daily record)
+#   2. logs/errors_YYYY-MM-DD.log  -> warnings + errors only (for diagnosing)
+#   3. console                     -> everything (full detail when watching live)
+# This keeps the daily file a clean trade ledger while nothing is actually lost:
+# all the plumbing/errors still land in the console and the errors file.
+# ─────────────────────────────────────────────────────────────────────────────
 _LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
-_log_filename = os.path.join(
-    _LOG_DIR, f"bot_{datetime.now().strftime('%Y-%m-%d')}.log"
-)
+_today = datetime.now().strftime("%Y-%m-%d")
+_trades_log_filename = os.path.join(_LOG_DIR, f"bot_{_today}.log")
+_errors_log_filename = os.path.join(_LOG_DIR, f"errors_{_today}.log")
+
+# Marker put on the few log records that represent actual trading activity.
+# Only records carrying this marker reach the clean daily (trades) file.
+_TRADE_MARK = "__trade__"
+
+
+def _trade(msg, *args):
+    """Log a trade/P&L line that WILL appear in the clean daily file."""
+    log.info(msg, *args, extra={_TRADE_MARK: True})
+
+
+class TradeOnlyFilter(logging.Filter):
+    """Pass ONLY records explicitly marked as trade/P&L activity."""
+    def filter(self, record):
+        return getattr(record, _TRADE_MARK, False) is True
 
 
 class DedupFilter(logging.Filter):
     """
-    Collapse reconnect-storm spam into a readable summary.
+    Collapse reconnect-storm spam in the errors file into a readable summary.
 
-    During an internet outage, alpaca-py retries the websocket ~1000x/sec, and
-    each failure logs an error line + a full multi-line traceback. One outage
-    can add tens of thousands of lines to the log file.
-
-    This filter lets the FIRST occurrence of a repeated message through, then
-    suppresses identical repeats. When the message finally changes (e.g. the
-    connection recovers), it emits a single "... suppressed N identical
-    messages" line so the outage is still visible — just compressed.
-
-    It also strips tracebacks off the suppressed records (a connection error
-    during an outage doesn't need its stack dumped thousands of times).
+    During a long internet outage, alpaca-py retries the websocket ~1000x/sec;
+    each failure logs an error. This lets the FIRST occurrence through, suppresses
+    identical repeats, and prints a "[N suppressed]" summary when the message
+    changes — so an outage is visible but compressed to a couple of lines.
     """
-
     def __init__(self):
         super().__init__()
         self._last_key = None
         self._suppressed = 0
 
     def filter(self, record):
-        # Key on logger + level + the message template (not the formatted args),
-        # so a steady stream of the same error collapses even if timestamps differ.
         key = (record.name, record.levelno, record.getMessage())
-
         if key == self._last_key:
-            # Repeat of the message we're already sitting on -> suppress it,
-            # but keep a running count so we can report it later.
             self._suppressed += 1
             return False
-
-        # A new, different message is coming through.
         if self._suppressed > 0:
-            # Annotate this record so the formatted output notes how many we hid.
-            # We piggyback on the record by prepending a summary via a flag the
-            # formatter picks up below.
             record.msg = (
                 f"[{self._suppressed} identical prior message(s) suppressed] "
                 f"{record.getMessage()}"
             )
             record.args = ()
             self._suppressed = 0
-
         self._last_key = key
         return True
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),                 # console (visible when interactive)
-        # Size-capped file so an internet-disruption error loop can't bloat it:
-        # 5 MB per file, keep 3 rotated backups (bot_YYYY-MM-DD.log.1/.2/.3).
-        RotatingFileHandler(
-            _log_filename, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-        ),
-    ],
-)
-
-# Attach the de-dup filter to the ROOT handlers so it applies to every logger,
-# including alpaca's. This is what tames the reconnect storm: the first error of
-# an outage is logged, repeats are collapsed, and recovery prints a summary.
-for _h in logging.getLogger().handlers:
-    _h.addFilter(DedupFilter())
-
-# Silence noisy third-party websocket loggers. On any internet blip the
-# `websockets` library dumps a full multi-line traceback (WinError 121 /
-# "data transfer failed"). It's harmless — alpaca-py auto-reconnects. Raise
-# these to CRITICAL so their tracebacks never reach the file at all.
-for _noisy in ("websockets", "websockets.client", "websockets.legacy",
-               "websockets.legacy.protocol"):
-    logging.getLogger(_noisy).setLevel(logging.CRITICAL)
-
-# Alpaca's own websocket logger (alpaca.data.live.websocket) is the one that
-# floods during a LONG outage (getaddrinfo/DNS retries ~1000x/sec, each with a
-# traceback). Keep it at WARNING so routine INFO connect/subscribe chatter stays
-# quiet, let real errors through ONCE (the DedupFilter collapses the repeats),
-# and strip the exception tracebacks it attaches so the file stays readable.
-logging.getLogger("alpaca.data.live.websocket").setLevel(logging.WARNING)
-logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 
 
 class _NoTracebackFilter(logging.Filter):
@@ -174,7 +139,42 @@ class _NoTracebackFilter(logging.Filter):
         return True
 
 
+_FMT = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+
+# 1. Clean daily TRADES file — only trade-marked records, no size worry.
+_trades_handler = RotatingFileHandler(
+    _trades_log_filename, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_trades_handler.setLevel(logging.INFO)
+_trades_handler.setFormatter(_FMT)
+_trades_handler.addFilter(TradeOnlyFilter())
+
+# 2. Errors file — WARNING and above only, deduped so an outage can't bloat it.
+_errors_handler = RotatingFileHandler(
+    _errors_log_filename, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_errors_handler.setLevel(logging.WARNING)
+_errors_handler.setFormatter(_FMT)
+_errors_handler.addFilter(DedupFilter())
+
+# 3. Console — everything (handy when running by hand).
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.INFO)
+_console_handler.setFormatter(_FMT)
+
+logging.basicConfig(level=logging.INFO,
+                    handlers=[_trades_handler, _errors_handler, _console_handler])
+
+# Silence noisy third-party websocket loggers entirely (harmless blips).
+for _noisy in ("websockets", "websockets.client", "websockets.legacy",
+               "websockets.legacy.protocol"):
+    logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+
+# Alpaca's websocket logger + asyncio: keep routine chatter out of everything.
+# WARNING+ still reaches the errors file (deduped, tracebacks stripped).
+logging.getLogger("alpaca.data.live.websocket").setLevel(logging.WARNING)
 logging.getLogger("alpaca.data.live.websocket").addFilter(_NoTracebackFilter())
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 
 log = logging.getLogger("QQQ_SQQQ_BOT")
 
@@ -344,7 +344,7 @@ class TradeState:
             "worst_price": entry_price,   # lowest price seen while holding (for MAE)
             "worst_pct": 0.0,             # most-negative pnl_pct seen (Max Adverse Excursion)
         }
-        log.info(f"🟢 ENTRY: {qty} shares of {ticker} @ ${entry_price:.2f}")
+        _trade(f"🟢 ENTRY: {qty} shares of {ticker} @ ${entry_price:.2f}")
     
     def exit(self, exit_price, reason):
         """
@@ -376,7 +376,7 @@ class TradeState:
         self.open_position = None
         self.last_exit_time = datetime.now(EST)
         
-        log.info(f"🔴 EXIT: {pos['ticker']} @ ${exit_price:.2f} | P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%) | {reason}")
+        _trade(f"🔴 EXIT: {pos['ticker']} @ ${exit_price:.2f} | P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%) | {reason}")
         
         return result
     
@@ -391,7 +391,8 @@ class TradeState:
         """Check if we've hit daily loss limit."""
         if self.daily_pnl <= -DAILY_LOSS_LIMIT:
             self.hibernating = True
-            log.warning(f"🚨 Daily loss limit hit: ${abs(self.daily_pnl):.2f}. HIBERNATING.")
+            log.warning(f"🚨 Daily loss limit hit: ${abs(self.daily_pnl):.2f}. HIBERNATING.",
+                        extra={_TRADE_MARK: True})
             return True
         return False
 
@@ -1064,7 +1065,7 @@ class QQQSQQQBot:
             if exit_details:
                 try:
                     TradeLogger.log_trade(exit_details)
-                    log.info(f"Daily P&L: ${self.state.daily_pnl:+.2f}")
+                    _trade(f"Daily P&L: ${self.state.daily_pnl:+.2f}")
                 except Exception as log_err:
                     log.error(f"TRADE LOG FAILED: {log_err} | details={exit_details}", exc_info=True)
                 # Shadow experiment: score all 3 stop rules on this trade (measurement only)
